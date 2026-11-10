@@ -1,0 +1,21 @@
+# Build output
+/mini-xui
+/mini-xui.exe
+/dist/
+
+# Local configuration, credentials and traffic data
+/config.json
+/config.json.bak
+/traffic.json
+/*.env
+/.env
+/*.pem
+/*.key
+*.db
+*.db-shm
+*.db-wal
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
