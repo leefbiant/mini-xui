@@ -23,7 +23,12 @@ func testApp(t *testing.T) *app {
 	if err := os.WriteFile(xray, []byte("#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s' '{\"stat\":[{\"name\":\"user>>>old>>>traffic>>>uplink\",\"value\":\"123\"}]}'; fi\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	return &app{config: cfg, xray: xray, statsFile: filepath.Join(dir, "stats.json"), api: "127.0.0.1:1", sessions: map[string]time.Time{"session": time.Now().Add(time.Hour)}, stats: map[string]statRecord{}}
+	db, stats, err := openStatsStore(filepath.Join(dir, "stats.db"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return &app{config: cfg, xray: xray, db: db, api: "127.0.0.1:1", sessions: map[string]time.Time{"session": time.Now().Add(time.Hour)}, stats: stats}
 }
 func post(t *testing.T, a *app, v url.Values) *httptest.ResponseRecorder {
 	t.Helper()
@@ -72,15 +77,11 @@ func TestStatsPersistsWithoutDoubleCounting(t *testing.T) {
 	a := testApp(t)
 	a.collect()
 	a.collect()
-	var data map[string]statRecord
-	b, e := os.ReadFile(a.statsFile)
-	if e != nil {
+	var got int64
+	if e := a.db.QueryRow("SELECT total FROM traffic WHERE name=?", "user>>>old>>>traffic>>>uplink").Scan(&got); e != nil {
 		t.Fatal(e)
 	}
-	if e = json.Unmarshal(b, &data); e != nil {
-		t.Fatal(e)
-	}
-	if got := data["user>>>old>>>traffic>>>uplink"].Total; got != 123 {
+	if got != 123 {
 		t.Fatalf("got %d", got)
 	}
 }
@@ -215,5 +216,58 @@ func TestDashboardShowsCorrectApplyInstructions(t *testing.T) {
 	body = dashboard()
 	if !strings.Contains(body, `action="/restart"`) || !strings.Contains(body, "重启并应用配置") {
 		t.Fatal("restart controls missing")
+	}
+}
+
+func TestStatsMigrationIsDurableAndRunsOnce(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "traffic.json")
+	dbPath := filepath.Join(dir, "traffic.db")
+	original := `{"user>>>one>>>traffic>>>uplink":{"total":1234,"last":37}}`
+	if err := os.WriteFile(legacy, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	db, stats, err := openStatsStore(dbPath, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats["user>>>one>>>traffic>>>uplink"].Total != 1234 || stats["user>>>one>>>traffic>>>uplink"].Last != 37 {
+		t.Fatal("legacy counters not imported")
+	}
+	stats["user>>>one>>>traffic>>>uplink"] = statRecord{Total: 1500, Last: 303}
+	if err = saveStats(db, stats); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, stats, err = openStatsStore(dbPath, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if stats["user>>>one>>>traffic>>>uplink"].Total != 1500 {
+		t.Fatal("legacy data reimported over database")
+	}
+	b, err := os.ReadFile(legacy)
+	if err != nil || string(b) != original {
+		t.Fatal("legacy file was changed")
+	}
+}
+func TestInvalidLegacyFileDoesNotMarkMigrationDone(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "traffic.json")
+	dbPath := filepath.Join(dir, "traffic.db")
+	_ = os.WriteFile(legacy, []byte("broken"), 0600)
+	if db, _, err := openStatsStore(dbPath, legacy); err == nil {
+		db.Close()
+		t.Fatal("invalid JSON accepted")
+	}
+	_ = os.WriteFile(legacy, []byte(`{"key":{"total":42,"last":7}}`), 0600)
+	db, stats, err := openStatsStore(dbPath, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if stats["key"].Total != 42 {
+		t.Fatal("retry failed to import")
 	}
 }

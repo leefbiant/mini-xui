@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -33,16 +34,17 @@ type statRecord struct {
 	Last  int64 `json:"last"`
 }
 type app struct {
-	mu                                     sync.Mutex
-	collectMu                              sync.Mutex
-	config, xray, api, statsFile, password string
-	publicHost                             string
-	restartService                         string
-	sessions                               map[string]time.Time
-	stats                                  map[string]statRecord
-	rates                                  map[string]int64
-	statsErr                               string
-	updated                                time.Time
+	mu                          sync.Mutex
+	collectMu                   sync.Mutex
+	config, xray, api, password string
+	db                          *sql.DB
+	publicHost                  string
+	restartService              string
+	sessions                    map[string]time.Time
+	stats                       map[string]statRecord
+	rates                       map[string]int64
+	statsErr                    string
+	updated                     time.Time
 }
 type client struct {
 	Email, Credential, Up, Down    string
@@ -500,10 +502,7 @@ func (a *app) collectUnlocked() {
 		old.Last = v
 		a.stats[s.Name] = old
 	}
-	data, e := json.MarshalIndent(a.stats, "", "  ")
-	if e == nil {
-		e = atomicWrite(a.statsFile, data)
-	}
+	e = saveStats(a.db, a.stats)
 	if e != nil {
 		a.statsErr = e.Error()
 		return
@@ -516,7 +515,8 @@ func main() {
 	xr := flag.String("xray", "xray", "Xray 可执行文件路径")
 	api := flag.String("api", "127.0.0.1:62789", "Xray Stats API 地址")
 	listen := flag.String("listen", "127.0.0.1:8080", "面板监听地址（仅限回环地址）")
-	stats := flag.String("stats", "./traffic.json", "流量统计文件")
+	stats := flag.String("stats", "./traffic.json", "首次启动时导入的旧版流量 JSON 文件")
+	dbPath := flag.String("db", "./mini-xui.db", "SQLite 数据库路径")
 	interval := flag.Duration("interval", 30*time.Second, "统计采集间隔")
 	publicHost := flag.String("public-host", "", "分享链接使用的公网 IP 或域名")
 	restartService := flag.String("restart-service", "", "允许重启的 systemd 服务名，留空禁用")
@@ -541,14 +541,12 @@ func main() {
 	if _, e = exec.LookPath(*xr); e != nil {
 		log.Fatal(e)
 	}
-	a := &app{config: *cfg, xray: *xr, api: *api, statsFile: *stats, password: password, publicHost: *publicHost, restartService: *restartService, sessions: map[string]time.Time{}, stats: map[string]statRecord{}}
-	if b, e := os.ReadFile(*stats); e == nil {
-		if e = json.Unmarshal(b, &a.stats); e != nil {
-			log.Fatal("统计文件无效：", e)
-		}
-	} else if !errors.Is(e, os.ErrNotExist) {
-		log.Fatal(e)
+	db, savedStats, e := openStatsStore(*dbPath, *stats)
+	if e != nil {
+		log.Fatal("无法打开统计数据库：", e)
 	}
+	defer db.Close()
+	a := &app{config: *cfg, xray: *xr, api: *api, db: db, password: password, publicHost: *publicHost, restartService: *restartService, sessions: map[string]time.Time{}, stats: savedStats}
 	go func() {
 		a.collect()
 		t := time.NewTicker(*interval)
@@ -874,10 +872,7 @@ func (a *app) restart(w http.ResponseWriter, r *http.Request) {
 		record.Last = 0
 		a.stats[name] = record
 	}
-	b, err := json.MarshalIndent(a.stats, "", "  ")
-	if err == nil {
-		err = atomicWrite(a.statsFile, b)
-	}
+	err = saveStats(a.db, a.stats)
 	if err != nil {
 		http.Error(w, "Xray 已重启，但流量状态保存失败："+err.Error(), 500)
 		return
